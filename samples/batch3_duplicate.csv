@@ -1,0 +1,4 @@
+photo_no,camera_no,captured_at,species,rel_path
+P0007,CAM01,2026-03-01T08:01:05Z,wild_boar,cam01/20260301/P0007.jpg
+P0008,CAM02,2026-03-01T09:30:40Z,red_fox,cam02/20260301/P0008.jpg
+P0009,CAM03,2026-03-01T12:00:00Z,sika_deer,cam03/20260301/P0009.jpg
