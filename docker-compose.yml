@@ -11,7 +11,12 @@ services:
       GAP_SECONDS: "60"      # 同相机相邻照片归组阈值（秒）
       # SPLIT_SALT: wildlife-trap-v1   # 改盐可整体重排训练/验证划分
     volumes:
-      - wildlife-data:/data   # SQLite 库与各版本索引文件，容器重建后数据仍在
+      - wildlife-data:/data   # SQLite 库、各版本索引与可信恢复副本，容器重建后数据仍在
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
 
 volumes:

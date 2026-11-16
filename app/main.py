@@ -10,6 +10,11 @@
   写锁串行化，页面与两份下载始终对应同一完整版本。
 * 幂等：同号同内容重投 -> 批次记为 noop，不产生新版本；
   同号异内容 -> 整批拒绝（rejected），库内不产生任何变化。
+* 索引校验与恢复：每个新版本发布时，两份索引的 sha256 + 独立可信副本
+  与版本行同事务留存（见 integrity.py）。任一索引缺失/被改动 -> 该版本
+  两份下载一起暂停；恢复只接受与可信摘要逐字节一致的原文件，版本号、
+  分组与训练/验证归属不变。旧版（上线前发布）两份都在时可按现存内容建档，
+  缺文件的旧版提示无法恢复，绝不用当前照片表重算。
 """
 
 from __future__ import annotations
@@ -26,10 +31,30 @@ from html import escape
 from pathlib import Path
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 from .grouping import Photo, assign_split, compute_groups
+from .integrity import (
+    INDEX_FILENAMES,
+    INDEX_KINDS,
+    INDEX_LABELS,
+    STATUS_LABELS as INTEGRITY_LABELS,
+    STATUS_OK,
+    STATUS_UNBASELINED,
+    IntegrityError,
+    adopt_version,
+    backfill_baseline,
+    create_baseline,
+    get_baseline,
+    get_version,
+    index_rel,
+    inspect_version,
+    record_verification,
+    refresh_statuses,
+    restore_index,
+    sha256_bytes,
+)
 
 REQUIRED_COLUMNS = ("photo_no", "camera_no", "captured_at", "species", "rel_path")
 INDEX_COLUMNS = ("photo_no", "camera_no", "captured_at", "species", "rel_path", "group_id")
@@ -60,6 +85,14 @@ class Settings:
     @property
     def versions_dir(self) -> Path:
         return self.data_dir / "versions"
+
+    @property
+    def recovery_dir(self) -> Path:
+        return self.data_dir / "recovery"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.data_dir / "integrity.lock"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -128,11 +161,45 @@ CREATE TABLE IF NOT EXISTS versions (
     train_count INTEGER NOT NULL,
     val_count INTEGER NOT NULL,
     train_path TEXT NOT NULL DEFAULT '',
-    val_path TEXT NOT NULL DEFAULT ''
+    val_path TEXT NOT NULL DEFAULT '',
+    integrity_status TEXT NOT NULL DEFAULT 'unbaselined',
+    integrity_detail TEXT,
+    recovered_at TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+-- 可信恢复依据：发布/建档时两份索引的 sha256、大小与独立副本。
+CREATE TABLE IF NOT EXISTS index_baselines (
+    version_id INTEGER NOT NULL REFERENCES versions(id),
+    kind TEXT NOT NULL,                 -- train | val
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    rel_path TEXT NOT NULL,             -- 独立副本（recovery/v{N}/...）
+    source TEXT NOT NULL,               -- publish | adopt | backfill
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (version_id, kind)
+);
+-- 最近一次显式校验结果（页面实时计算，不依赖此表）。
+CREATE TABLE IF NOT EXISTS index_checks (
+    version_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,               -- ok | corrupt | missing
+    sha256 TEXT,
+    checked_at TEXT NOT NULL,
+    detail TEXT,
+    PRIMARY KEY (version_id, kind)
+);
+-- 校验/建档/恢复审计。
+CREATE TABLE IF NOT EXISTS recovery_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    action TEXT NOT NULL,               -- publish | verify | adopt | backfill | recover
+    status TEXT NOT NULL,               -- ok | partial | rejected | failed
+    source TEXT,                        -- publish | disk | upload | baseline | repair
+    message TEXT
 );
 """
 
@@ -148,15 +215,62 @@ def connect(settings: Settings) -> sqlite3.Connection:
 
 def init_storage(settings: Settings) -> None:
     settings.versions_dir.mkdir(parents=True, exist_ok=True)
+    settings.recovery_dir.mkdir(parents=True, exist_ok=True)
     conn = connect(settings)
     try:
         conn.executescript(SCHEMA)
+        _migrate_legacy_versions(conn)
+        # 清理上次进程崩溃遗留的"目录已落盘、版本行未提交"的孤儿目录，
+        # 否则重试发布会因目录已存在而失败。
+        _cleanup_orphan_dirs(settings, conn)
+        # 按磁盘现状刷新校验结果（只记录状态，不修改任何索引文件）。
+        refresh_statuses(settings, conn)
     finally:
         conn.close()
     # 清理上次进程崩溃可能遗留的临时目录（完整版本目录永不动）
     for d in settings.versions_dir.iterdir():
         if d.is_dir() and d.name.startswith(".tmp-"):
             shutil.rmtree(d, ignore_errors=True)
+    for d in settings.recovery_dir.iterdir():
+        if d.is_dir() and d.name.startswith(".tmp-"):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def _migrate_legacy_versions(conn: sqlite3.Connection) -> None:
+    """旧库升级：补 integrity_status 等列（默认 unbaselined，不自动信任）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(versions)")}
+    if "integrity_status" not in cols:
+        conn.execute("ALTER TABLE versions ADD COLUMN integrity_status TEXT NOT NULL DEFAULT 'unbaselined'")
+    if "integrity_detail" not in cols:
+        conn.execute("ALTER TABLE versions ADD COLUMN integrity_detail TEXT")
+    if "recovered_at" not in cols:
+        conn.execute("ALTER TABLE versions ADD COLUMN recovered_at TEXT")
+
+
+def _cleanup_orphan_dirs(settings: Settings, conn: sqlite3.Connection) -> None:
+    """删除没有对应 versions 行的 v{N} 目录（发布在 rename 后、提交前中断的遗留）。
+
+    只在该版本既无 versions 行、也无 index_baselines 行时删除，绝不触碰有效版本。
+    """
+    known = {int(r["id"]) for r in conn.execute("SELECT id FROM versions")}
+    known |= {
+        int(r["version_id"])
+        for r in conn.execute("SELECT DISTINCT version_id FROM index_baselines")
+    }
+    for root in (settings.versions_dir, settings.recovery_dir):
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for d in entries:
+            if not d.is_dir() or not d.name.startswith("v"):
+                continue
+            try:
+                vid = int(d.name[1:])
+            except ValueError:
+                continue
+            if vid not in known:
+                shutil.rmtree(d, ignore_errors=True)
 
 
 def get_active_version(conn: sqlite3.Connection) -> int | None:
@@ -300,9 +414,10 @@ def record_rejected_batch(settings: Settings, filename: str, rows_total: int, me
 
 
 def process_batch(settings: Settings, filename: str, rows: list[CsvRow]) -> tuple[str, int, str]:
-    """在单个写事务内完成：冲突检测 -> 入库 -> 归组划分 -> 索引落盘 -> 切换现役版本。"""
+    """在单个写事务内完成：冲突检测 -> 入库 -> 归组划分 -> 索引落盘 -> 留存恢复依据 -> 切换现役版本。"""
     conn = connect(settings)
     published_dir: Path | None = None
+    baseline_dir: Path | None = None
     try:
         conn.execute("BEGIN IMMEDIATE")
 
@@ -373,19 +488,31 @@ def process_batch(settings: Settings, filename: str, rows: list[CsvRow]) -> tupl
         vid = int(cur.lastrowid)
 
         # 索引文件落盘（tmp + rename）。失败 -> 异常 -> 整体回滚，现役版本不变。
+        # 若上次发布在 rename 后、提交前中断，会遗留同号目录（该 vid 从未提交，
+        # 因为本事务刚刚分配它）；先清掉，保证重试可以完成。
+        orphan = settings.versions_dir / f"v{vid}"
+        if orphan.exists():
+            shutil.rmtree(orphan, ignore_errors=True)
         published_dir = write_version_files(settings.versions_dir, vid, train_rows, val_rows)
         rel = Path("versions") / f"v{vid}"
+        train_rel = str(rel / "train_index.csv")
+        val_rel = str(rel / "val_index.csv")
         conn.execute(
             "UPDATE versions SET train_path=?, val_path=? WHERE id=?",
-            (str(rel / "train_index.csv"), str(rel / "val_index.csv"), vid),
+            (train_rel, val_rel, vid),
         )
+        # 可信恢复依据：两份索引的独立副本 + sha256，与版本在同一事务内成立。
+        baseline_dir = settings.recovery_dir / f"v{vid}"
+        if baseline_dir.exists():
+            shutil.rmtree(baseline_dir, ignore_errors=True)
+        create_baseline(settings, conn, vid, train_rel, val_rel, source="publish")
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('active_version', ?)"
             " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(vid),),
         )
         conn.execute("UPDATE batches SET version_id=? WHERE id=?", (vid, batch_id))
-        msg = f"已发布版本 v{vid}：新增 {len(new_rows)} 张（重复 {dup} 张），共 {len(all_photos)} 张 / {len(groups)} 组，训练 {len(train_rows)} / 验证 {len(val_rows)}"
+        msg = f"已发布版本 v{vid}：新增 {len(new_rows)} 张（重复 {dup} 张），共 {len(all_photos)} 张 / {len(groups)} 组，训练 {len(train_rows)} / 验证 {len(val_rows)}；两份索引已留存可信恢复依据"
         conn.execute("UPDATE batches SET message=? WHERE id=?", (msg, batch_id))
         conn.execute("COMMIT")
         return "applied", batch_id, msg
@@ -397,6 +524,8 @@ def process_batch(settings: Settings, filename: str, rows: list[CsvRow]) -> tupl
             pass
         if published_dir is not None:  # 回滚后版本目录成为孤儿，安全清理（写锁保证只有本事务在写）
             shutil.rmtree(published_dir, ignore_errors=True)
+        if baseline_dir is not None:  # 回滚后可信副本目录同样成为孤儿
+            shutil.rmtree(baseline_dir, ignore_errors=True)
         try:  # 失败审计（独立小事务，失败不影响主流程）
             conn.execute("BEGIN IMMEDIATE")
             _record_batch(conn, filename, len(rows), 0, 0, "failed", f"发布失败，现役版本未变：{exc}"[:500])
@@ -432,6 +561,14 @@ pre{padding:10px;overflow:auto;font-size:13px}
 .btn.secondary{background:#5a6b5d}
 .muted{color:#666;font-size:13px}
 ol.steps li{margin-bottom:6px}
+.tag{display:inline-block;border-radius:4px;padding:1px 7px;font-size:12px;white-space:nowrap}
+.tag-ok{background:#e6f4e6;border:1px solid #7ab87a;color:#1d5c1d}
+.tag-bad{background:#fde8e8;border:1px solid #e08a8a;color:#8a1f1f}
+.paused{color:#8a1f1f;font-weight:600}
+form.inline{display:inline-block;margin:2px 6px 2px 0}
+form.inline input[type=file]{max-width:180px;font-size:12px;display:block;margin-bottom:4px}
+.callout{border:1px solid #8aa8e0;background:#eef4ff;border-radius:6px;padding:10px 16px;margin-bottom:20px;font-size:14px}
+.callout-err{border-color:#e08a8a;background:#fdeeee}
 """
 
 
@@ -452,26 +589,46 @@ def flash_html(msg: str, kind: str) -> str:
     return f'<div class="flash flash-{kind}">{escape(msg)}</div>'
 
 
+def integrity_badge(status: str) -> str:
+    cls = "ok" if status in (STATUS_OK, STATUS_UNBASELINED) else "bad"
+    lab = INTEGRITY_LABELS.get(status, "下载已暂停")
+    return f'<span class="tag tag-{cls}">{escape(lab)}</span>'
+
+
 def home_page(settings: Settings, msg: str, kind: str) -> str:
     conn = connect(settings)
     try:
         active_id = get_active_version(conn)
         versions = conn.execute("SELECT * FROM versions ORDER BY id DESC").fetchall()
         batches = conn.execute("SELECT * FROM batches ORDER BY id DESC LIMIT 50").fetchall()
+        states = {int(v["id"]): inspect_version(settings, conn, v) for v in versions}
     finally:
         conn.close()
 
-    # 现役版本横幅
+    # 现役版本横幅：校验未通过的版本不发下载链接（两份一起暂停）。
     if active_id is not None:
         active = next((v for v in versions if v["id"] == active_id), None)
-        banner = (
-            f'<div class="card"><h2 style="margin-top:0">现役版本 <span class="badge">v{active_id}</span></h2>'
-            f"<p>照片 {active['photo_count']} 张 · 出没事件组 {active['group_count']} 个 · "
-            f"训练 {active['train_count']} / 验证 {active['val_count']} · 发布于 {active['created_at']} UTC</p>"
-            f'<p><a class="btn" href="/versions/{active_id}/files/train_index.csv">下载训练索引</a> '
-            f'<a class="btn" href="/versions/{active_id}/files/val_index.csv">下载验证索引</a> '
-            f'<a class="btn secondary" href="/versions/{active_id}">查看分组</a></p></div>'
-        )
+        if active is None:
+            banner = '<div class="card"><p>现役版本记录缺失。</p></div>'
+        else:
+            st = states[active_id]
+            if st.downloads_allowed:
+                links = (
+                    f'<p><a class="btn" href="/versions/{active_id}/files/train_index.csv">下载训练索引</a> '
+                    f'<a class="btn" href="/versions/{active_id}/files/val_index.csv">下载验证索引</a> '
+                    f'<a class="btn secondary" href="/versions/{active_id}">查看分组</a></p>'
+                )
+            else:
+                links = (
+                    f'<p><a class="btn secondary" href="/versions/{active_id}">查看并处理索引异常</a></p>'
+                )
+            banner = (
+                f'<div class="card"><h2 style="margin-top:0">现役版本 <span class="badge">v{active_id}</span> '
+                f"{integrity_badge(st.status)}</h2>"
+                f"<p>照片 {active['photo_count']} 张 · 出没事件组 {active['group_count']} 个 · "
+                f"训练 {active['train_count']} / 验证 {active['val_count']} · 发布于 {active['created_at']} UTC</p>"
+                f'<p class="muted">{escape(st.summary)}</p>{links}</div>'
+            )
     else:
         banner = '<div class="card"><p>尚未发布任何版本，请上传第一批 CSV。</p></div>'
 
@@ -509,18 +666,27 @@ def home_page(settings: Settings, msg: str, kind: str) -> str:
     if versions:
         vrows = []
         for v in versions:
-            active_badge = ' <span class="badge">现役</span>' if v["id"] == active_id else ""
+            vid = int(v["id"])
+            st = states[vid]
+            active_badge = ' <span class="badge">现役</span>' if vid == active_id else ""
+            if st.downloads_allowed:
+                downloads = (
+                    f'<a href="/versions/{vid}/files/train_index.csv">train</a> · '
+                    f'<a href="/versions/{vid}/files/val_index.csv">val</a>'
+                )
+            else:
+                downloads = '<span class="paused">下载已暂停</span>'
             vrows.append(
-                f"<tr><td><a href=\"/versions/{v['id']}\">v{v['id']}</a>{active_badge}</td>"
+                f"<tr><td><a href=\"/versions/{vid}\">v{vid}</a>{active_badge}</td>"
                 f"<td>{v['created_at']}</td><td>{v['photo_count']}</td><td>{v['group_count']}</td>"
                 f"<td>{v['train_count']}</td><td>{v['val_count']}</td>"
-                f'<td><a href="/versions/{v["id"]}/files/train_index.csv">train</a> · '
-                f'<a href="/versions/{v["id"]}/files/val_index.csv">val</a></td></tr>'
+                f"<td>{integrity_badge(st.status)}</td><td>{downloads}</td></tr>"
             )
         versions_html = (
             '<div class="card"><h2 style="margin-top:0">版本历史（旧版本链接内容不变）</h2>'
             "<table><tr><th>版本</th><th>发布时间(UTC)</th><th>照片数</th><th>组数</th>"
-            "<th>训练</th><th>验证</th><th>索引下载</th></tr>" + "".join(vrows) + "</table></div>"
+            "<th>训练</th><th>验证</th><th>索引校验</th><th>索引下载</th></tr>"
+            + "".join(vrows) + "</table></div>"
         )
     else:
         versions_html = ""
@@ -547,28 +713,44 @@ def home_page(settings: Settings, msg: str, kind: str) -> str:
     return page("首页", flash_html(msg, kind) + banner + upload + samples_html + versions_html + batches_html)
 
 
-def version_detail_page(settings: Settings, vid: int) -> str:
+def version_detail_page(settings: Settings, vid: int, msg: str = "", kind: str = "info") -> str:
     conn = connect(settings)
     try:
-        v = conn.execute("SELECT * FROM versions WHERE id=?", (vid,)).fetchone()
+        v = get_version(conn, vid)
         active_id = get_active_version(conn)
+        if v is None:
+            raise HTTPException(404, "版本不存在")
+        integrity = inspect_version(settings, conn, v)
+        events = conn.execute(
+            "SELECT * FROM recovery_events WHERE version_id=? ORDER BY id DESC LIMIT 20",
+            (vid,),
+        ).fetchall()
+        photo_count = conn.execute("SELECT COUNT(*) AS n FROM photos").fetchone()["n"]
+        # 发布时若恢复依据没写成，提示可补建（只按现存字节，不重算）。
+        needs_retry = (
+            active_id is not None and get_baseline(conn, active_id, "train") is None
+        )
     finally:
         conn.close()
-    if v is None:
-        raise HTTPException(404, "版本不存在")
 
     groups: dict[str, dict] = {}
-    for split, col in (("train", "train_path"), ("val", "val_path")):
-        path = settings.data_dir / v[col]
-        if not path.is_file():
-            raise HTTPException(500, f"索引文件缺失: {v[col]}")
-        with open(path, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                g = groups.setdefault(row["group_id"], {"split": split, "rows": []})
-                g["rows"].append(row)
+    read_errors: list[str] = []
+    for split, kind_name in (("train", "train"), ("val", "val")):
+        path = settings.data_dir / index_rel(v, kind_name)
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    # 异常索引可能含残缺行；展示层跳过，不影响校验/暂停判定。
+                    if not row.get("group_id") or not row.get("captured_at") or not row.get("photo_no"):
+                        continue
+                    g = groups.setdefault(row["group_id"], {"split": split, "rows": []})
+                    g["rows"].append(row)
+        except (OSError, KeyError, csv.Error) as exc:
+            read_errors.append(f"{INDEX_LABELS[kind_name]}无法用于展示分组：{exc}")
 
     grows = []
-    for gid in sorted(groups, key=lambda g: (min(r["captured_at"] for r in groups[g]["rows"]), g)):
+    sortable = [gid for gid in groups if groups[gid]["rows"]]
+    for gid in sorted(sortable, key=lambda g: (min(r["captured_at"] for r in groups[g]["rows"]), g)):
         g = groups[gid]
         times = sorted(r["captured_at"] for r in g["rows"])
         members = ", ".join(r["photo_no"] for r in sorted(g["rows"], key=lambda r: (r["captured_at"], r["photo_no"])))
@@ -579,18 +761,140 @@ def version_detail_page(settings: Settings, vid: int) -> str:
             f"<td>{split_label}</td><td>{escape(members)}</td></tr>"
         )
 
+    # ---------------------------------------------------- 校验与恢复面板
+    rows_html = []
+    for kind in INDEX_KINDS:
+        st = integrity.states[kind]
+        recorded = st.recorded_sha256 or "—"
+        actual = st.actual_sha256 or "—"
+        actions = []
+        if st.can_upload and not st.ok:
+            actions.append(
+                f'<form class="inline" action="/versions/{vid}/recover" method="post" enctype="multipart/form-data">'
+                f'<input type="hidden" name="kind" value="{kind}">'
+                f'<input type="file" name="file" accept=".csv,text/csv" required>'
+                f'<button class="btn" type="submit">上传原文件恢复</button></form>'
+            )
+        if st.can_restore_copy and not st.ok:
+            actions.append(
+                f'<form class="inline" action="/versions/{vid}/recover" method="post">'
+                f'<input type="hidden" name="kind" value="{kind}">'
+                f'<input type="hidden" name="source" value="baseline">'
+                f'<button class="btn secondary" type="submit">从可信副本恢复</button></form>'
+            )
+        if st.can_repair_copy and not st.ok:
+            actions.append(
+                f'<form class="inline" action="/versions/{vid}/recover" method="post">'
+                f'<input type="hidden" name="kind" value="{kind}">'
+                f'<input type="hidden" name="source" value="repair">'
+                f'<button class="btn secondary" type="submit">重建可信副本</button></form>'
+            )
+        if not actions:
+            actions.append(
+                '<span class="muted">无需恢复</span>' if st.ok else '<span class="muted">无可用操作</span>'
+            )
+        rows_html.append(
+            f"<tr><td>{escape(st.label)}<br><code>{escape(st.filename)}</code></td>"
+            f"<td>{integrity_badge(st.status)}<br><span class=\"muted\">{escape(st.detail)}</span></td>"
+            f"<td><code title=\"可信摘要\">{recorded[:16]}{'…' if recorded != '—' else ''}</code></td>"
+            f"<td><code title=\"当前磁盘内容摘要\">{actual[:16]}{'…' if actual != '—' else ''}</code></td>"
+            f"<td>{''.join(actions)}</td></tr>"
+        )
+
+    if integrity.ok:
+        dl = (
+            f'<p><a class="btn" href="/versions/{vid}/files/train_index.csv">下载训练索引</a> '
+            f'<a class="btn" href="/versions/{vid}/files/val_index.csv">下载验证索引</a></p>'
+        )
+        paused_note = ""
+    elif integrity.status == STATUS_UNBASELINED:
+        dl = (
+            f'<p><a class="btn" href="/versions/{vid}/files/train_index.csv">下载训练索引</a> '
+            f'<a class="btn" href="/versions/{vid}/files/val_index.csv">下载验证索引</a></p>'
+        )
+        paused_note = (
+            '<p class="muted">旧版尚未建档：当前可继续下载，但在此之前无法发现文件改动。'
+            "建议按现存内容建档。</p>"
+        )
+    else:
+        dl = '<p><span class="paused">该版本两份下载均已暂停（任一份异常即同时停用）</span></p>'
+        paused_note = (
+            '<p class="muted">说明：恢复只写回与可信摘要逐字节一致的原文件；版本号、分组与训练/验证归属'
+            "均来自原索引，不会用当前照片表重算。</p>"
+        )
+
+    if integrity.can_adopt:
+        adopt_form = f"""
+<div class="callout">
+<p><strong>这是一个旧版本</strong>：发布时尚未留存可信恢复依据。两份索引目前都可读取，
+可按现存内容建档；建档后任何改动都会被校验发现。</p>
+<form action="/versions/{vid}/adopt" method="post">
+<button class="btn" type="submit">按现存内容建档</button></form>
+</div>"""
+    elif all(st.recorded_sha256 is None for st in integrity.states.values()):
+        # 无任何可信摘要：只要有一份缺失，就不能建档（也不能重算）。
+        adopt_form = """
+<div class="callout callout-err">
+<p><strong>该旧版本无法建档恢复</strong>：至少一份索引文件缺失，且发布时未留存可信恢复依据。
+不会根据当前照片表重算（那样无法保证原版本号、分组与训练/验证归属）。</p>
+</div>"""
+    else:
+        adopt_form = ""
+
+    evrows = "".join(
+        f"<tr><td>{e['created_at']}</td><td>{escape(e['action'])}</td>"
+        f"<td>{escape(e['status'])}</td><td>{escape(e['source'] or '—')}</td>"
+        f"<td>{escape(e['message'] or '')}</td></tr>"
+        for e in events
+    )
+    events_html = (
+        '<div class="card"><h3 style="margin-top:0">校验与恢复记录</h3>'
+        "<table><tr><th>时间(UTC)</th><th>操作</th><th>结果</th><th>来源</th><th>说明</th></tr>"
+        f"{evrows}</table></div>"
+        if events else ""
+    )
+
+    group_hint = ""
+    if read_errors:
+        group_hint = "".join(f'<p class="muted">{escape(e)}</p>' for e in read_errors)
+    else:
+        group_hint = (
+            f'<p class="muted">当前照片库共 {photo_count} 张；本页分组来自该版本索引原文件。</p>'
+        )
+
+    retry_html = ""
+    if needs_retry:
+        retry_html = f"""
+<div class="callout">
+<p><strong>现役版本 v{active_id} 尚无可信恢复依据</strong>（上次发布可能在中途中断）。
+若两份索引文件仍在，可按现存字节补建恢复依据；不会新增照片，也不会改变版本号、分组与训练/验证归属。</p>
+<form action="/versions/{active_id}/backfill" method="post">
+<button class="btn" type="submit">按现存文件补建可信恢复依据</button></form>
+</div>"""
+
     active_badge = ' <span class="badge">现役</span>' if vid == active_id else ""
     body = f"""
-<div class="card"><h2 style="margin-top:0">版本 v{vid}{active_badge}</h2>
+<div class="card"><h2 style="margin-top:0">版本 v{vid}{active_badge} {integrity_badge(integrity.status)}</h2>
 <p>发布于 {v['created_at']} UTC · 照片 {v['photo_count']} 张 · 组 {v['group_count']} 个 ·
 训练 {v['train_count']} / 验证 {v['val_count']}</p>
-<p><a class="btn" href="/versions/{vid}/files/train_index.csv">下载训练索引</a>
-<a class="btn" href="/versions/{vid}/files/val_index.csv">下载验证索引</a>
-<a class="btn secondary" href="/">返回首页</a></p></div>
-<div class="card"><h2 style="margin-top:0">出没事件分组（group_id = 组内最早照片号）</h2>
+<p class="muted">{escape(integrity.summary)}{(' · 最近恢复于 ' + escape(v['recovered_at'] or '')) if v['recovered_at'] else ''}</p>
+{dl}
+<p><a class="btn secondary" href="/">返回首页</a></p></div>
+{retry_html}
+<div class="card"><h3 style="margin-top:0">索引校验与恢复</h3>
+<table><tr><th>索引</th><th>状态</th><th>可信摘要</th><th>当前文件摘要</th><th>恢复操作</th></tr>
+{''.join(rows_html)}</table>
+{paused_note}
+<form class="inline" action="/versions/{vid}/verify" method="post">
+<button class="btn secondary" type="submit">重新校验</button></form>
+</div>
+{adopt_form}
+<div class="card"><h3 style="margin-top:0">出没事件分组（group_id = 组内最早照片号）</h3>
+{group_hint}
 <table><tr><th>group_id</th><th>相机</th><th>开始(UTC)</th><th>结束(UTC)</th><th>张数</th><th>划分</th><th>成员照片</th></tr>
-{''.join(grows)}</table></div>"""
-    return page(f"版本 v{vid}", body)
+{''.join(grows)}</table></div>
+{events_html}"""
+    return page(f"版本 v{vid}", flash_html(msg, kind) + body)
 
 
 def batch_detail_page(settings: Settings, bid: int) -> str:
@@ -667,32 +971,136 @@ def create_app(settings: Settings) -> FastAPI:
         try:
             status, batch_id, message = process_batch(settings, filename, rows)
         except Exception as exc:  # 发布失败：事务已回滚，现役版本不变
+            detail = f"：{exc}" if str(exc) else ""
             return RedirectResponse(
-                "/?" + urlencode({"kind": "err", "msg": f"发布失败，现役版本未变：{exc}"}), 303
+                "/?" + urlencode({"kind": "err", "msg": f"发布失败，现役版本未变{detail}"}), 303
             )
         kind = {"applied": "ok", "noop": "info", "rejected": "err"}[status]
         return RedirectResponse("/?" + urlencode({"kind": kind, "msg": message}), 303)
 
     @app.get("/versions/{vid}", response_class=HTMLResponse)
-    def version_detail(vid: int) -> str:
-        return version_detail_page(settings, vid)
+    def version_detail(vid: int, msg: str = "", kind: str = "info") -> str:
+        return version_detail_page(settings, vid, msg, kind)
+
+    def _version_redirect(vid: int, msg: str, kind: str) -> RedirectResponse:
+        return RedirectResponse(
+            f"/versions/{vid}?" + urlencode({"kind": kind, "msg": msg}), 303
+        )
+
+    @app.post("/versions/{vid}/verify")
+    def verify_version(vid: int):
+        conn = connect(settings)
+        try:
+            try:
+                integrity = record_verification(settings, conn, vid)
+            except IntegrityError as exc:
+                raise HTTPException(404, str(exc)) from exc
+        finally:
+            conn.close()
+        if integrity.status == STATUS_UNBASELINED:
+            return _version_redirect(
+                vid, "该旧版本尚未建档：两份索引可读，请按现存内容建档后再校验", "info"
+            )
+        if not integrity.ok:
+            return _version_redirect(vid, "校验未通过：" + integrity.summary, "err")
+        return _version_redirect(vid, "校验通过：两份索引均与原发布字节一致", "ok")
+
+    @app.post("/versions/{vid}/adopt")
+    def adopt(vid: int):
+        conn = connect(settings)
+        try:
+            try:
+                msg = adopt_version(settings, conn, vid)
+            except IntegrityError as exc:
+                return _version_redirect(vid, str(exc), "err")
+        finally:
+            conn.close()
+        return _version_redirect(vid, msg, "ok")
+
+    @app.post("/versions/{vid}/backfill")
+    def backfill(vid: int):
+        conn = connect(settings)
+        try:
+            try:
+                msg = backfill_baseline(settings, conn, vid)
+            except (IntegrityError, OSError) as exc:
+                return _version_redirect(vid, str(exc), "err")
+        finally:
+            conn.close()
+        return _version_redirect(vid, msg, "ok")
+
+    @app.post("/versions/{vid}/recover")
+    def recover(
+        vid: int,
+        kind: str = Form(...),
+        source: str = Form("upload"),
+        file: UploadFile | None = File(None),
+    ):
+        if kind not in INDEX_KINDS:
+            return _version_redirect(vid, "未知索引类型", "err")
+        data = None
+        src = source
+        if source == "upload":
+            if file is None:
+                return _version_redirect(vid, "请选择要上传恢复的索引文件", "err")
+            data = file.file.read(MAX_UPLOAD_BYTES + 1)
+            if len(data) > MAX_UPLOAD_BYTES:
+                return _version_redirect(vid, "文件超过 100MB 限制", "err")
+        elif source not in ("baseline", "repair"):
+            return _version_redirect(vid, "未知恢复方式", "err")
+
+        conn = connect(settings)
+        try:
+            try:
+                msg = restore_index(settings, conn, vid, kind, data=data, source=src)
+            except IntegrityError as exc:
+                return _version_redirect(vid, str(exc), "err")
+            except OSError as exc:
+                return _version_redirect(
+                    vid, f"恢复写入失败，未提供半恢复的索引；可重试：{exc}", "err"
+                )
+        finally:
+            conn.close()
+        kindcls = "ok"
+        conn = connect(settings)
+        try:
+            v = get_version(conn, vid)
+            if v is not None and not inspect_version(settings, conn, v).ok:
+                kindcls = "info"
+        finally:
+            conn.close()
+        return _version_redirect(vid, msg, kindcls)
 
     @app.get("/versions/{vid}/files/{name}")
     def version_file(vid: int, name: str):
-        if name not in ("train_index.csv", "val_index.csv"):
+        if name not in INDEX_FILENAMES.values():
             raise HTTPException(404, "未知文件")
         conn = connect(settings)
         try:
-            v = conn.execute("SELECT * FROM versions WHERE id=?", (vid,)).fetchone()
+            v = get_version(conn, vid)
+            if v is None:
+                raise HTTPException(404, "版本不存在")
+            integrity = inspect_version(settings, conn, v)
         finally:
             conn.close()
-        if v is None:
-            raise HTTPException(404, "版本不存在")
-        rel = v["train_path"] if name == "train_index.csv" else v["val_path"]
-        path = settings.data_dir / rel
-        if not path.is_file():
-            raise HTTPException(404, "索引文件缺失")
-        return FileResponse(path, media_type="text/csv", filename=f"v{vid}_{name}")
+        which = "train" if name == "train_index.csv" else "val"
+        if not integrity.downloads_allowed:
+            # 任一份异常 -> 两份一起暂停，绝不提供可能已被改动的索引。
+            raise HTTPException(409, "该版本索引校验未通过，两份下载均已暂停：" + integrity.summary)
+        path = settings.data_dir / index_rel(v, which)
+        # 读入内存并按刚校验过的摘要再确认一次，避免校验后文件被替换的竞态。
+        try:
+            data = path.read_bytes()
+        except OSError:
+            raise HTTPException(409, "索引文件缺失，下载已暂停")
+        expected = integrity.states[which].recorded_sha256
+        if expected is not None and sha256_bytes(data) != expected:
+            raise HTTPException(409, "索引在读取过程中被改动，下载已暂停；请重新校验并恢复")
+        return Response(
+            content=data,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="v{vid}_{name}"'},
+        )
 
     @app.get("/batches/{bid}", response_class=HTMLResponse)
     def batch_detail(bid: int) -> str:

@@ -13,7 +13,7 @@ docker compose up --build
 # 打开 http://localhost:8000
 ```
 
-数据（SQLite 库 + 各版本索引文件）持久化在命名卷 `wildlife-data` 中，容器重建不丢。
+数据（SQLite 库 + 各版本索引 + 可信恢复副本）持久化在命名卷 `wildlife-data` 中，容器重建不丢。
 
 ## 浏览器演示：跨批补传样例
 
@@ -28,6 +28,22 @@ docker compose up --build
 
 任意时刻打开 v1 的下载链接，内容保持最初发布时的原样（版本不可变）。
 首页「版本历史」可进入每个版本查看分组明细，「批次记录」查看每批的处理结果与拒绝原因。
+
+### 浏览器演示：校验与恢复
+
+1. 完成上表第 1、2 步后打开 `http://localhost:8000/versions/2`，可见两份索引
+   “校验通过”及各自的可信摘要。
+2. 在宿主机直接破坏卷内文件（模拟存储事故）：
+
+   ```bash
+   docker compose exec web sh -c 'printf "tampered\n" > /data/versions/v2/val_index.csv'
+   ```
+
+   刷新版本页：验证索引显示“内容被改动”，**训练与验证两份下载都返回 409**（页面不再给下载链接）；
+   v1 仍照常下载。
+3. 点“从可信副本恢复”（或上传最初下载的原文件）：两份恢复为原字节，下载立即恢复，
+   版本号、分组与训练/验证归属不变。
+4. 删除 `data/recovery/v2/` 中的副本后，可“重建可信副本”（前提是公开文件仍为原字节）。
 
 ## CSV 格式
 
@@ -63,12 +79,36 @@ P0002,CAM01,2026-03-01T08:00:00Z,wild_boar,cam01/20260301/P0002.jpg
 - **幂等**：同号同内容重投 → 批次记 `noop`，不产生新版本；
   同号异内容 → 整批 `rejected`。
 
+## 索引校验与恢复
+
+存储卷里的索引 CSV 可能丢失或被改动。版本页（`/versions/{N}`）提供校验与恢复：
+
+- **可信恢复依据（新发布版本必留两份）**：发布时把 `train_index.csv` 与
+  `val_index.csv` 的原字节复制到 `data/recovery/v{N}/`，并把 sha256 + 大小写入
+  `index_baselines`。依据与 `versions` 行在**同一事务**内提交：依据写不成，
+  整个发布回滚（版本号不前进、现役版本不变），重试可完成。
+- **校验**：页面每次按磁盘现状实时比对两份索引与可信摘要，并显示
+  “校验通过 / 内容被改动 / 文件缺失 / 恢复依据损坏 / 未建档”。
+  校验永远以已记录摘要为准，**绝不用当前照片表重算**。
+- **双份暂停**：任一份异常 → 该版本 train/val 两份下载一起返回 409，
+  页面不提供下载链接；其他完好版本照常下载。下载时还会在内存中按摘要再复核一次。
+- **恢复原字节**：可上传原文件（必须与可信摘要逐字节一致，否则拒绝且不写任何文件），
+  或从可信副本一键恢复；可信副本损坏而公开文件仍正确时可“重建可信副本”。
+  恢复只写回原索引字节，**版本号、分组、训练/验证归属不变**。单文件写入是
+  `fsync + os.replace` 原子替换；下载放行条件是“两份都通过”，因此恢复中断时
+  不会暴露半恢复的索引，重试即可完成（恢复与补传发布可交错进行，互不阻塞）。
+- **旧版本（本功能上线前发布）**：两份文件都可读时，页面提供“按现存内容建档”，
+  建档后同样受校验保护；**任一文件缺失时明确提示无法恢复**，不会重算。
+  若发布恰在“版本已提交、依据未写”的窗口中断，版本页会提供“按现存文件补建依据”。
+
+恢复/建档/校验都会记入 `recovery_events`，版本页末尾可查看最近 20 条。
+
 ## 本地开发与测试
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest tests/ -q          # 15 个测试：归组逻辑 + 端到端（含并发、发布失败回滚）
+python -m pytest tests/ -q          # 30 个测试：归组 + 端到端 + 校验/恢复（损坏、旧版、中断重试）
 DATA_DIR=./data SAMPLES_DIR=./samples uvicorn app.main:app --reload
 ```
 
@@ -76,7 +116,7 @@ DATA_DIR=./data SAMPLES_DIR=./samples uvicorn app.main:app --reload
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DATA_DIR` | `./data`（容器内 `/data`） | SQLite 与版本索引存放目录 |
+| `DATA_DIR` | `./data`（容器内 `/data`） | SQLite、版本索引与可信恢复副本存放目录 |
 | `SAMPLES_DIR` | `./samples` | 样例 CSV 目录（存在时首页显示演示入口） |
 | `VAL_PERCENT` | `20` | 验证集目标比例（按组分桶） |
 | `GAP_SECONDS` | `60` | 同相机相邻照片归组阈值（秒） |
@@ -88,8 +128,9 @@ DATA_DIR=./data SAMPLES_DIR=./samples uvicorn app.main:app --reload
 app/
   main.py        # FastAPI 应用：上传、版本发布、页面、下载（含事务与落盘逻辑）
   grouping.py    # 归组与稳定划分（纯函数，可单测）
+  integrity.py   # 索引校验、可信恢复依据、旧版建档与恢复
 samples/         # 跨批补传演示的四个样例 CSV
-tests/           # 单元测试 + 端到端测试
+tests/           # 单元测试 + 端到端测试（含损坏与中断重试）
 Dockerfile
 docker-compose.yml
 ```
